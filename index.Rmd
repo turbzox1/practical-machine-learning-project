@@ -1,0 +1,170 @@
+---
+title: "Predicting How Well People Lift: Weight Lifting Exercise Classification"
+author: "Piyush Patni"
+date: "October 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", cache = TRUE)
+```
+
+## Overview
+
+Fitness trackers are good at counting *how much* exercise people do, but not *how well* they do it. In this project I use data from accelerometers on the belt, forearm, arm and dumbbell of 6 participants who performed barbell lifts in five different ways. Class A is the correct technique, while classes B to E are common mistakes. My goal is to predict this `classe` variable from the sensor readings and then apply the final model to 20 test cases.
+
+The data comes from the Weight Lifting Exercise Dataset by Velloso et al. (2013), *Qualitative Activity Recognition of Weight Lifting Exercises*, available at http://groupware.les.inf.puc-rio.br/har. Many thanks to the authors for making it available.
+
+## Loading the data
+
+The raw files mark missing values in a few different ways (`NA`, empty strings and `#DIV/0!`), so I treat all of them as `NA` when reading.
+
+```{r load}
+library(caret)
+library(randomForest)
+
+training_raw <- read.csv("pml-training.csv", na.strings = c("NA", "", "#DIV/0!"))
+testing_raw  <- read.csv("pml-testing.csv",  na.strings = c("NA", "", "#DIV/0!"))
+
+dim(training_raw)
+dim(testing_raw)
+table(training_raw$classe)
+```
+
+The training set has `r nrow(training_raw)` rows and `r ncol(training_raw)` columns. The five classes are reasonably balanced; class A is the most common, but none of the others is rare, so plain accuracy is a sensible metric here.
+
+## Cleaning the data
+
+Looking at the columns, I noticed three kinds that aren't useful for prediction:
+
+1. **Mostly empty columns.** About 100 columns (kurtosis, skewness, max, min, averages and so on) are only filled in on the rows where a new time window starts, which is about 2% of the data. Everywhere else they're `NA`. They're also completely empty in the test set, so a model couldn't use them anyway.
+2. **Bookkeeping columns.** The row index, participant name, timestamps and window numbers describe *when* and *who*, not *how* the lift was done. Since the data was recorded in order, the row index and timestamps line up almost perfectly with `classe`. A model would latch onto that, look brilliant in validation, and then fail on genuinely new data. So I drop them.
+3. **Near-zero-variance columns.** I check for these too, though after the first two steps none are left.
+
+```{r clean}
+# 1. drop columns that are more than 90% missing
+mostly_na <- colMeans(is.na(training_raw)) > 0.9
+training <- training_raw[, !mostly_na]
+
+# 2. drop the ID / time / window columns (first 7)
+training <- training[, -(1:7)]
+
+# 3. check for near-zero variance predictors
+nzv <- nearZeroVar(training)
+length(nzv)
+
+training$classe <- factor(training$classe)
+dim(training)
+```
+
+That leaves **`r ncol(training) - 1` predictors** plus `classe`, with no missing values left (`r sum(is.na(training))` NAs).
+
+## Splitting for validation
+
+The provided "testing" file only has 20 rows and no labels, so it can't tell me how good the model is. To get an honest estimate of out-of-sample error I split the cleaned training data: 70% to build models and 30% held back as a validation set that I only touch once, at the very end.
+
+```{r split}
+set.seed(2026)
+in_train  <- createDataPartition(training$classe, p = 0.7, list = FALSE)
+train_set <- training[in_train, ]
+valid_set <- training[-in_train, ]
+
+c(train = nrow(train_set), validation = nrow(valid_set))
+```
+
+## A quick look at the data
+
+Before modelling, I wanted to see whether the sensors separate the classes at all. The plot below shows two belt readings coloured by class. The classes overlap a lot in any two dimensions, which tells me a simple linear boundary won't be enough and a flexible, tree-based model is a better fit.
+
+```{r eda, fig.width=7, fig.height=4.5}
+featurePlot_df <- train_set[sample(nrow(train_set), 3000), ]
+ggplot2::ggplot(featurePlot_df, ggplot2::aes(roll_belt, magnet_belt_y, colour = classe)) +
+  ggplot2::geom_point(alpha = 0.5, size = 1) +
+  ggplot2::labs(title = "Belt roll vs belt magnetometer (y), by class",
+                x = "roll_belt", y = "magnet_belt_y") +
+  ggplot2::theme_minimal()
+```
+
+## Cross validation and model choice
+
+I compared three models that were covered in the course, all trained with the same **5-fold cross validation** using `trainControl`. Cross validation here does two jobs. It tunes each model's settings (like the number of variables tried at each split in a random forest), and it gives a first estimate of how each model performs on data it wasn't trained on.
+
+- **Decision tree (`rpart`)** - simple and easy to interpret, a good baseline.
+- **Gradient boosting (`gbm`)** - builds many small trees, each correcting the last.
+- **Random forest (`rf`)** - averages many deep trees built on bootstrapped samples; usually strong on this kind of sensor data.
+
+```{r models}
+ctrl <- trainControl(method = "cv", number = 5)
+
+set.seed(2026)
+fit_tree <- train(classe ~ ., data = train_set, method = "rpart",
+                  trControl = ctrl, tuneLength = 10)
+
+set.seed(2026)
+fit_gbm <- train(classe ~ ., data = train_set, method = "gbm",
+                 trControl = ctrl, verbose = FALSE)
+
+set.seed(2026)
+fit_rf <- train(classe ~ ., data = train_set, method = "rf",
+                trControl = ctrl, ntree = 150)
+```
+
+### Comparing the models
+
+```{r compare}
+cv_results <- resamples(list(Tree = fit_tree, GBM = fit_gbm, RandomForest = fit_rf))
+summary(cv_results)$statistics$Accuracy
+```
+
+```{r compare-plot, fig.width=7, fig.height=3.5}
+bwplot(cv_results, metric = "Accuracy", main = "5-fold cross-validated accuracy")
+```
+
+The decision tree on its own is clearly weaker, at around `r round(max(fit_tree$results$Accuracy), 2)` accuracy. Boosting does much better (`r round(max(fit_gbm$results$Accuracy), 3)`), and the random forest comes out on top at **`r round(max(fit_rf$results$Accuracy), 4)`**. It also has the smallest spread across folds, which suggests it's stable rather than lucky on one split. I chose the **random forest** as my final model. It's slower to train and harder to interpret than a single tree, but for this task, prediction accuracy is what matters.
+
+## Expected out-of-sample error
+
+Cross-validation accuracy is already an out-of-sample estimate, but the model selection step used it too, so it can be slightly optimistic. The cleanest estimate comes from the 30% validation set the models have never seen.
+
+```{r validate}
+pred_valid <- predict(fit_rf, valid_set)
+cm <- confusionMatrix(pred_valid, valid_set$classe)
+cm$table
+cm$overall[c("Accuracy", "AccuracyLower", "AccuracyUpper")]
+```
+
+On the validation set the random forest gets an accuracy of **`r round(cm$overall["Accuracy"] * 100, 2)`%**, so my expected out-of-sample error is about **`r round((1 - cm$overall["Accuracy"]) * 100, 2)`%** (95% CI for accuracy: `r round(cm$overall["AccuracyLower"]*100, 2)`% to `r round(cm$overall["AccuracyUpper"]*100, 2)`%). Looking at the confusion matrix, the few mistakes are scattered between neighbouring classes rather than concentrated in one place, which is reassuring. With an error rate this low, I'd expect all or nearly all of the 20 test cases to be predicted correctly.
+
+### Which sensors matter most?
+
+```{r importance, fig.width=7, fig.height=4.5}
+imp <- varImp(fit_rf)
+plot(imp, top = 15, main = "Top 15 predictors (random forest)")
+```
+
+The belt sensor dominates: `roll_belt`, `yaw_belt` and `pitch_belt` are among the most important variables, followed by forearm pitch and dumbbell magnetometer readings. That makes sense physically, since several of the mistake classes (like throwing the hips forward) change how the torso moves.
+
+## Predicting the 20 test cases
+
+Finally, I apply the same cleaning to the test file (keeping exactly the columns the model was trained on) and predict.
+
+```{r predict-test}
+test_set <- testing_raw[, names(training)[names(training) != "classe"]]
+test_pred <- predict(fit_rf, test_set)
+data.frame(problem_id = testing_raw$problem_id, prediction = test_pred)
+```
+
+## Summary
+
+- I cleaned the data down to `r ncol(training) - 1` sensor predictors, removing columns that were almost all missing and the ID/time columns that would have leaked information about the class.
+- I compared a decision tree, gradient boosting and a random forest using 5-fold cross validation, and the random forest was the most accurate and most stable.
+- On a 30% held-out validation set, the random forest reached `r round(cm$overall["Accuracy"] * 100, 2)`% accuracy, giving an **expected out-of-sample error of about `r round((1 - cm$overall["Accuracy"]) * 100, 2)`%**.
+- The final model was used to predict the 20 test cases shown above.
+
+One caveat worth mentioning: all the data comes from just 6 young male participants under supervision, so I wouldn't expect the same accuracy on very different people or on unsupervised workouts without collecting more data.
